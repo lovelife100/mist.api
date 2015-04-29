@@ -1,6 +1,7 @@
 import os
 import shutil
 import random
+import socket
 import tempfile
 import json
 import requests
@@ -11,7 +12,6 @@ from datetime import datetime
 from hashlib import sha256
 from StringIO import StringIO
 from tempfile import NamedTemporaryFile
-
 from netaddr import IPSet, IPNetwork
 
 from libcloud.compute.providers import get_driver
@@ -41,6 +41,7 @@ from mist.io.shell import Shell
 from mist.io.helpers import get_temp_file
 from mist.io.helpers import get_auth_header
 from mist.io.helpers import parse_ping
+from mist.io.helpers import check_host
 from mist.io.bare_metal import BareMetalDriver
 from mist.io.exceptions import *
 
@@ -218,13 +219,33 @@ def add_backend_v_2(user, title, provider, params):
         raise RequiredParameterMissingError("provider")
     log.info("Adding new backend in provider '%s' with Api-Version: 2", provider)
 
+    # perform hostname validation if hostname is supplied
+    if provider in ['vcloud', 'bare_metal', 'docker', 'libvirt', 'openstack', 'vsphere', 'coreos']:
+        if provider == 'vcloud':
+            hostname = params.get('host', '')
+        elif provider == 'bare_metal':
+            hostname = params.get('machine_ip', '')
+        elif provider == 'docker':
+            hostname = params.get('docker_host', '')
+        elif provider == 'libvirt':
+            hostname = params.get('machine_hostname', '')
+        elif provider == 'openstack':
+            hostname = params.get('auth_url', '')
+        elif provider == 'vsphere':
+            hostname = params.get('host', '')
+        elif provider == 'coreos':
+            hostname = params.get('machine_ip', '')
+
+        if hostname:
+            check_host(hostname)
+
     baremetal = provider == 'bare_metal'
 
     if provider == 'bare_metal':
-        backend_id = _add_backend_bare_metal(user, title, provider, params)
+        backend_id, mon_dict = _add_backend_bare_metal(user, title, provider, params)
         log.info("Backend with id '%s' added succesfully.", backend_id)
         trigger_session_update(user.email, ['backends'])
-        return backend_id
+        return {'backend_id': backend_id, 'monitoring': mon_dict}
     elif provider == 'ec2':
         backend_id, backend = _add_backend_ec2(user, title, params)
     elif provider == 'rackspace':
@@ -270,13 +291,17 @@ def add_backend_v_2(user, title, provider, params):
         except Exception as exc:
             log.error("Error while adding backend%r" % exc)
             raise BackendUnavailableError(exc)
-        try:
-            machines = conn.list_nodes()
-        except InvalidCredsError:
-            raise BackendUnauthorizedError()
-        except Exception as exc:
-            log.error("Error while trying list_nodes: %r", exc)
-            raise BackendUnavailableError(exc=exc)
+        if provider not in ['vshere']:
+            # in some providers -eg vSphere- this is not needed
+            # as we are sure we got a succesfull connection with
+            # the provider if connect_provider doesn't fail
+            try:
+                machines = conn.list_nodes()
+            except InvalidCredsError:
+                raise BackendUnauthorizedError()
+            except Exception as exc:
+                log.error("Error while trying list_nodes: %r", exc)
+                raise BackendUnavailableError(exc=exc)
 
     with user.lock_n_load():
         user.backends[backend_id] = backend
@@ -291,42 +316,52 @@ def add_backend_v_2(user, title, provider, params):
         username = backend.apikey
         associate_key(user, key_id, backend_id, node_id, username=username)
 
-    return backend_id
+    return {'backend_id': backend_id}
 
 
 def _add_backend_bare_metal(user, title, provider, params):
     """
     Add a bare metal backend
     """
-    machine_hostname = params.get('machine_ip', '')
-    if not machine_hostname:
-        raise RequiredParameterMissingError('machine_hostname')
-
     remove_on_error = params.get('remove_on_error', True)
     machine_key = params.get('machine_key', '')
     machine_user = params.get('machine_user', '')
-
-    if remove_on_error:
-        if not machine_key:
-            raise RequiredParameterMissingError('machine_key')
-        if machine_key not in user.keypairs:
-            raise KeypairNotFoundError(machine_key)
-        if not machine_user:
-            machine_user = 'root'
-
+    is_windows = params.get('windows', False)
+    if is_windows:
+        os_type = 'windows'
+    else:
+        os_type = 'unix'
     try:
         port = int(params.get('machine_port', 22))
     except:
         port = 22
-    machine = model.Machine()
-    machine.dns_name = machine_hostname
-    machine.ssh_port = port
+    try:
+        rdp_port = int(params.get('remote_desktop_port', 3389))
+    except:
+        rdp_port = 3389
+    machine_hostname = params.get('machine_ip', '')
 
-    machine.public_ips = [machine_hostname]
-    machine_id = machine_hostname.replace('.', '').replace(' ', '')
-    machine.name = machine_hostname
+    use_ssh = remove_on_error and os_type == 'unix' and machine_key
+    if use_ssh:
+        if machine_key not in user.keypairs:
+            raise KeypairNotFoundError(machine_key)
+        if not machine_hostname:
+            raise BadRequestError("You have specified an SSH key but machine "
+                                  "hostname is empty.")
+        if not machine_user:
+            machine_user = 'root'
+
+    machine = model.Machine()
+    machine.ssh_port = port
+    machine.remote_desktop_port = rdp_port
+    if machine_hostname:
+        machine.dns_name = machine_hostname
+        machine.public_ips = [machine_hostname]
+    machine_id = title.replace('.', '').replace(' ', '')
+    machine.name = title
+    machine.os_type = os_type
     backend = model.Backend()
-    backend.title = title or machine_hostname
+    backend.title = title
     backend.provider = provider
     backend.enabled = True
     backend.machines[machine_id] = machine
@@ -338,7 +373,7 @@ def _add_backend_bare_metal(user, title, provider, params):
         user.backends[backend_id] = backend
         # try to connect. this will either fail and we'll delete the
         # backend, or it will work and it will create the association
-        if remove_on_error:
+        if use_ssh:
             try:
                 ssh_command(
                     user, backend_id, machine_id, machine_hostname, 'uptime',
@@ -346,12 +381,22 @@ def _add_backend_bare_metal(user, title, provider, params):
                     port=port
                 )
             except MachineUnauthorizedError as exc:
-                # remove backend
-                del user.backends[backend_id]
-                user.save()
                 raise BackendUnauthorizedError(exc)
+            except ServiceUnavailableError as exc:
+                raise MistError("Couldn't connect to host '%s'."
+                                % machine_hostname)
         user.save()
-    return backend_id
+    if params.get('monitoring'):
+        try:
+            from mist.core.methods import enable_monitoring as _en_monitoring
+        except ImportError:
+            _en_monitoring = enable_monitoring
+        mon_dict = _en_monitoring(user, backend_id, machine_id,
+                                  no_ssh=not use_ssh)
+    else:
+        mon_dict = {}
+
+    return backend_id, mon_dict
 
 
 def _add_backend_vcloud(title, provider, params):
@@ -728,6 +773,34 @@ def _add_backend_hostvirtual(title, provider, params):
     backend.provider = provider
     backend.apikey = api_key
     backend.apisecret = api_key
+    backend.enabled = True
+    backend_id = backend.get_id()
+
+    return backend_id, backend
+
+
+def _add_backend_vsphere(title, provider, params):
+    username = params.get('username', '')
+    if not username:
+        raise RequiredParameterMissingError('username')
+
+    password = params.get('password', '')
+    if not password:
+        raise RequiredParameterMissingError('password')
+
+    host = params.get('host', '')
+    if not host:
+        raise RequiredParameterMissingError('host')
+    for prefix in ['https://', 'http://']:
+        host = host.strip(prefix)
+    host = host.split('/')[0]
+
+    backend = model.Backend()
+    backend.title = title
+    backend.provider = provider
+    backend.apikey = username
+    backend.apisecret = password
+    backend.apiurl = host
     backend.enabled = True
     backend_id = backend.get_id()
 
@@ -1125,10 +1198,8 @@ def connect_provider(backend):
     elif backend.provider == Provider.LIBVIRT:
         # support the three ways to connect: local system, qemu+tcp, qemu+ssh
         if backend.apisecret:
-            temp_key_file = NamedTemporaryFile(delete=False)
-            temp_key_file.write(backend.apisecret)
-            temp_key_file.close()
-            conn = driver(backend.apiurl, user=backend.apikey, ssh_key=temp_key_file.name, ssh_port=backend.ssh_port)
+            with get_temp_file(backend.apisecret) as tmp_key_path:
+                conn = driver(backend.apiurl, user=backend.apikey, ssh_key=tmp_key_path, ssh_port=backend.ssh_port)
         else:
             conn = driver(backend.apiurl, user=backend.apikey)
     else:
@@ -1160,7 +1231,7 @@ def get_machine_actions(machine_from_api, conn, extra):
     if conn.type in (Provider.RACKSPACE_FIRST_GEN, Provider.LINODE,
                      Provider.NEPHOSCALE, Provider.SOFTLAYER,
                      Provider.DIGITAL_OCEAN, Provider.DOCKER, Provider.AZURE,
-                     Provider.VCLOUD, Provider.INDONESIAN_VCLOUD, Provider.LIBVIRT, Provider.HOSTVIRTUAL):
+                     Provider.VCLOUD, Provider.INDONESIAN_VCLOUD, Provider.LIBVIRT, Provider.HOSTVIRTUAL, Provider.VSPHERE):
         can_tag = False
 
     # for other states
@@ -1207,11 +1278,19 @@ def get_machine_actions(machine_from_api, conn, extra):
         can_destroy = False
         can_start = False
 
+    if conn.type in (Provider.LINODE, Provider.NEPHOSCALE, Provider.DIGITAL_OCEAN,
+                     Provider.DOCKER, Provider.OPENSTACK, Provider.RACKSPACE) or conn.type in config.EC2_PROVIDERS:
+        can_rename = True
+    else:
+        can_rename = False
+
+
     return {'can_stop': can_stop,
             'can_start': can_start,
             'can_destroy': can_destroy,
             'can_reboot': can_reboot,
-            'can_tag': can_tag}
+            'can_tag': can_tag,
+            'can_rename': can_rename}
 
 
 def list_machines(user, backend_id):
@@ -1271,7 +1350,9 @@ def list_machines(user, backend_id):
                    'extra': m.extra}
         machine.update(get_machine_actions(m, conn, m.extra))
         ret.append(machine)
-
+    if conn.type == 'libvirt':
+        # close connection with libvirt
+        conn.disconnect()
     return ret
 
 
@@ -1998,12 +2079,12 @@ def _create_machine_linode(conn, key_name, private_key, public_key,
     return node
 
 
-def _machine_action(user, backend_id, machine_id, action, plan_id=None):
+def _machine_action(user, backend_id, machine_id, action, plan_id=None, name=None):
     """Start, stop, reboot, resize and destroy have the same logic underneath, the only
     thing that changes is the action. This helper function saves us some code.
 
     """
-    actions = ('start', 'stop', 'reboot', 'destroy', 'resize')
+    actions = ('start', 'stop', 'reboot', 'destroy', 'resize', 'rename')
 
     if action not in actions:
         raise BadRequestError("Action '%s' should be one of %s" % (action,
@@ -2076,6 +2157,8 @@ def _machine_action(user, backend_id, machine_id, action, plan_id=None):
                 conn.ex_stop_node(machine)
         elif action is 'resize':
             conn.ex_resize_node(node, plan_id)
+        elif action is 'rename':
+            conn.ex_rename_node(node, name)
         elif action is 'reboot':
             if bare_metal:
                 try:
@@ -2167,6 +2250,11 @@ def reboot_machine(user, backend_id, machine_id):
     _machine_action(user, backend_id, machine_id, 'reboot')
 
 
+def rename_machine(user, backend_id, machine_id, name):
+    """Renames a machine on a certain backend."""
+    _machine_action(user, backend_id, machine_id, 'rename', name=name)
+
+
 def resize_machine(user, backend_id, machine_id, plan_id):
     """Resize a machine on an other plan."""
     _machine_action(user, backend_id, machine_id, 'resize', plan_id=plan_id)
@@ -2225,6 +2313,11 @@ def ssh_command(user, backend_id, machine_id, host, command,
     Raises MachineUnauthorizedError if it doesn't manage to connect.
 
     """
+
+    if backend_id not in user.backends:
+        raise BackendNotFoundError(backend_id)
+    else:
+        backend = user.backends[backend_id]
 
     shell = Shell(host)
     key_id, ssh_user = shell.autoconfigure(user, backend_id, machine_id,
@@ -2364,7 +2457,7 @@ def list_backends(user):
     ret = []
     for backend_id in user.backends:
         backend = user.backends[backend_id]
-        ret.append({'id': backend_id,
+        info = {'id': backend_id,
                     'apikey': backend.apikey,
                     'title': backend.title or backend.provider,
                     'provider': backend.provider,
@@ -2375,7 +2468,13 @@ def list_backends(user):
                     # for Provider.RACKSPACE (the new Nova provider)
                     ## 'datacenter': backend.datacenter,
                     'enabled': backend.enabled,
-                    'tenant_name': backend.tenant_name})
+                    'tenant_name': backend.tenant_name}
+
+        if backend.provider == 'docker':
+            info['docker_port'] = backend.docker_port
+
+        ret.append(info)
+
     return ret
 
 
@@ -2420,6 +2519,9 @@ def list_sizes(user, backend_id):
                     'price': size.price,
                     'ram': size.ram})
 
+    if conn.type == 'libvirt':
+        # close connection with libvirt
+        conn.disconnect()
     return ret
 
 
@@ -2460,6 +2562,9 @@ def list_locations(user, backend_id):
                     'name': name,
                     'country': location.country})
 
+    if conn.type == 'libvirt':
+        # close connection with libvirt
+        conn.disconnect()
     return ret
 
 
@@ -2525,6 +2630,10 @@ def list_networks(user, backend_id):
         networks = conn.ex_list_networks()
         for network in networks:
             ret.append(ec2_network_to_dict(network))
+
+    if conn.type == 'libvirt':
+        # close connection with libvirt
+        conn.disconnect()
     return ret
 
 
@@ -2850,8 +2959,8 @@ def enable_monitoring(user, backend_id, machine_id,
         'action': 'enable',
         'no_ssh': True,
         'dry': dry,
-        'name': name,
-        'public_ips': ",".join(public_ips),
+        'name': name or backend.title,
+        'public_ips': ",".join(public_ips or []),
         'dns_name': dns_name,
         'backend_title': backend.title,
         'backend_provider': backend.provider,
@@ -2998,7 +3107,6 @@ def probe_ssh_only(user, backend_id, machine_id, host, key_id='', ssh_user='',
         macs[ips[i]] = m[i]
     pub_ips = find_public_ips(ips)
     priv_ips = [ip for ip in ips if ip not in pub_ips]
-
 
     return {
         'uptime': uptime,
@@ -3523,12 +3631,16 @@ def undeploy_collectd(user, backend_id, machine_id):
     return ret_dict
 
 
-def get_deploy_collectd_manual_command(uuid, password, monitor):
+def get_deploy_collectd_command_unix(uuid, password, monitor):
     url = "https://github.com/mistio/deploy_collectd/raw/master/local_run.py"
     cmd = "wget -O - %s | sudo python - %s %s" % (url, uuid, password)
     if monitor != 'monitor1.mist.io':
         cmd += " -m %s" % monitor
     return cmd
+
+
+def get_deploy_collectd_command_windows(uuid, password, monitor):
+     return '''powershell.exe -command "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force;(New-Object System.Net.WebClient).DownloadFile('https://github.com/mistio/collectm/blob/build_issues/scripts/collectm.remote.install.ps1?raw=true', '.\collectm.remote.install.ps1');.\collectm.remote.install.ps1 -gitBranch ""build_issues"" -SetupConfigFile -setupArgs '-username """"%s"""""" -password """"""%s"""""" -servers @(""""""%s:25826"""""") -interval 10'"''' % (uuid, password, monitor)
 
 
 def machine_name_validator(provider, name):

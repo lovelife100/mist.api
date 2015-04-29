@@ -32,6 +32,8 @@ PY_LOG_FORMAT = settings.get("PY_LOG_FORMAT", '%(asctime)s %(levelname)s %(threa
 PY_LOG_FORMAT_DATE = settings.get("PY_LOG_FORMAT_DATE", "%Y-%m-%d %H:%M:%S")
 GOOGLE_ANALYTICS_ID = settings.get("GOOGLE_ANALYTICS_ID", "")
 COMMAND_TIMEOUT = settings.get("COMMAND_TIMEOUT", 20)
+ALLOW_CONNECT_LOCALHOST = settings.get('ALLOW_CONNECT_LOCALHOST', True)
+ALLOW_CONNECT_PRIVATE = settings.get('ALLOW_CONNECT_PRIVATE', True)
 
 # celery settings
 CELERY_SETTINGS = {
@@ -52,7 +54,7 @@ STATES = {
     NodeState.TERMINATED: 'terminated',
     NodeState.PENDING: 'pending',
     # we assume unknown means stopped, especially for the EC2 case
-    NodeState.UNKNOWN: 'stopped',
+    NodeState.UNKNOWN: 'unknown',
     NodeState.STOPPED: 'stopped',
     NodeState.ERROR: 'error',
     NodeState.PAUSED: 'paused',
